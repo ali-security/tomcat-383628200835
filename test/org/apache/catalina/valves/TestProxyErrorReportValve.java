@@ -18,9 +18,12 @@ package org.apache.catalina.valves;
 
 import java.io.IOException;
 import java.io.Serial;
+import java.lang.reflect.Field;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.ResourceBundle;
 
 import jakarta.servlet.http.HttpServlet;
 import jakarta.servlet.http.HttpServletRequest;
@@ -333,6 +336,96 @@ public class TestProxyErrorReportValve extends TomcatBaseTest {
         String body = res.toString();
         Assert.assertNotNull(body);
         Assert.assertFalse(body.contains("Server broke"));
+    }
+
+
+    /*
+     * With usePropertiesFile, the bundle lookup uses the response locale which
+     * applications commonly set from the request. Unknown locales must not add
+     * entries to the JVM wide ResourceBundle cache and, as no properties file
+     * is available, the default error report must be used.
+     */
+    @Test
+    public void testPropertiesFileUnknownLocaleResourceBundleCacheUsage() throws Exception {
+        Tomcat tomcat = getTomcatInstance();
+        StandardHost host = (StandardHost) tomcat.getHost();
+        host.setErrorReportValveClass(PROXY_VALVE);
+
+        Context ctx = getProgrammaticRootContext();
+
+        Tomcat.addServlet(ctx, "localeError", new LocaleSendErrorServlet(HttpServletResponse.SC_NOT_FOUND));
+        ctx.addServletMappingDecoded("/", "localeError");
+
+        tomcat.start();
+
+        ProxyErrorReportValve proxyErrorReportValve = null;
+        for (Valve valve : host.getPipeline().getValves()) {
+            if (valve instanceof ProxyErrorReportValve) {
+                proxyErrorReportValve = (ProxyErrorReportValve) valve;
+                break;
+            }
+        }
+        Assert.assertNotNull(proxyErrorReportValve);
+        proxyErrorReportValve.setUsePropertiesFile(true);
+
+        int initial = resourceBundleCacheSize();
+
+        final int requests = 200;
+        // Use tags distinct from those used by other tests
+        final int offset = 200000;
+        for (int i = 0; i < requests; i++) {
+            Map<String,List<String>> reqHead = new HashMap<>();
+            reqHead.put("Accept-Language", Collections.singletonList(fakeLanguageTag(offset + i)));
+            ByteChunk res = new ByteChunk();
+            int rc = getUrl("http://localhost:" + getPort() + "/", res, reqHead, null);
+            Assert.assertEquals(HttpServletResponse.SC_NOT_FOUND, rc);
+            Assert.assertTrue("Should contain default error report",
+                    res.toString().contains(String.valueOf(HttpServletResponse.SC_NOT_FOUND)));
+        }
+
+        int delta = resourceBundleCacheSize() - initial;
+        Assert.assertTrue("ResourceBundle cache grew by " + delta + " entries for " + requests +
+                " unknown response locales", delta < 50);
+    }
+
+
+    private static String fakeLanguageTag(int i) {
+        StringBuilder tag = new StringBuilder("xxxxx");
+        int v = i;
+        for (int k = 4; k >= 0; k--) {
+            tag.setCharAt(k, (char) ('a' + v % 26));
+            v /= 26;
+        }
+        return tag.toString();
+    }
+
+
+    @SuppressWarnings("unchecked")
+    private static int resourceBundleCacheSize() throws Exception {
+        Field field = ResourceBundle.class.getDeclaredField("cacheList");
+        field.setAccessible(true);
+        Map<Object,Object> cache = (Map<Object,Object>) field.get(null);
+        return cache.size();
+    }
+
+
+    private static final class LocaleSendErrorServlet extends HttpServlet {
+
+        @Serial
+        private static final long serialVersionUID = 1L;
+
+        private final int statusCode;
+
+        private LocaleSendErrorServlet(int statusCode) {
+            this.statusCode = statusCode;
+        }
+
+        @Override
+        protected void doGet(HttpServletRequest req, HttpServletResponse resp)
+                throws IOException {
+            resp.setLocale(req.getLocale());
+            resp.sendError(statusCode);
+        }
     }
 
 
